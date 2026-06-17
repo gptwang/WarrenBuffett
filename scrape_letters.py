@@ -1,14 +1,9 @@
 """抓取巴菲特致股东信 → 原始文件 + Markdown（MinerU）
 
 版本选择:
-    1977-1997: 直接 HTML（页面即信件内容）
-    1998-2003: 导航页，下载 PDF 版本（Berkshire 推荐）
-    2004-2024: 直接 PDF
-
-模型选择:
-    默认: extract --model vlm（高精度，复杂表格强，需 token）
-    --pipeline: extract --model pipeline（积分消耗低，表格列容易错位）
-    --flash: 先 flash-extract（限 20 页）→ vlm 兜底
+    1977-1997: 直接 HTML（页面即信件内容）→ mineru crawl
+    1998-2003: 导航页，下载 PDF 版本 → mineru extract --model vlm
+    2004-2024: 直接 PDF → mineru extract --model vlm
 
 用法:
     python scrape_letters.py                 # 抓取所有年份（已存在跳过）
@@ -47,7 +42,7 @@ def load_token() -> str:
                 token = line.split("=", 1)[1].strip()
                 if token:
                     return token
-    return ""  # PDF flash-extract 不需要 token
+    return ""
 
 
 def fetch_letter_list():
@@ -113,75 +108,56 @@ def resolve_source(year, base_url, ext):
     return base_url, f"{year}.html", "html"
 
 
-def _run_mineru(cmd: list, env: dict, tmp_dir: Path) -> Path | None:
-    """执行 mineru 命令，返回 md 文件路径"""
+def _run_mineru(cmd: list, env: dict, tmp_dir: Path) -> tuple[Path | None, str]:
+    """执行 mineru 命令，返回 (md_file_path, error_msg)。error_msg 为空表示成功。"""
     result = subprocess.run(
         cmd, env=env, capture_output=True, text=True, timeout=600,
         shell=True if sys.platform == "win32" else False,
     )
     if result.returncode != 0:
-        return None
+        err = (result.stderr or result.stdout).strip()
+        # 提取关键错误行
+        lines = [l for l in err.split("\n") if l.strip()]
+        return None, lines[-1] if lines else "unknown error"
     md_files = list(tmp_dir.glob("*.md"))
-    return md_files[0] if md_files else None
+    if md_files:
+        return md_files[0], ""
+    return None, "no .md output"
 
 
-def convert_with_mineru(file_path: Path, url: str, ext: str, token: str,
-                        use_vlm: bool = True, use_flash: bool = False) -> Path | None:
-    """MinerU 转换 → 返回 markdown 文件路径
+def convert_with_mineru(src_path: Path, url: str, ext: str, token: str,
+                        dest_path: Path) -> bool:
+    """MinerU 转换 → 写入 dest_path。返回 True 表示成功。
 
-    策略:
-      - HTML: crawl
-      - PDF: 默认 extract --model vlm（高精度，复杂表格强）
-      - --pipeline: 改用 flash-extract → extract pipeline（积分消耗低，但表格列容易错位）
+    HTML: crawl（免费，无需 token）
+    PDF:  extract --model vlm（高精度表格，需 token）
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="mineru_"))
-    env = os.environ.copy()
-    if token:
-        env["MINERU_TOKEN"] = token
+    try:
+        env = os.environ.copy()
 
-    md_file = None
-
-    if ext == "html":
-        md_file = _run_mineru(
-            ["mineru-open-api", "crawl", url, "-o", str(tmp_dir)], env, tmp_dir)
-    else:
-        if not token:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            print(" [FAIL] 需 token")
-            return None
-
-        if use_flash:
-            # flash-extract 走起，失败再 vlm
-            md_file = _run_mineru(
-                ["mineru-open-api", "flash-extract", str(file_path), "-o", str(tmp_dir)],
-                env, tmp_dir)
-            if md_file is None:
-                print("flash 失败 → vlm ...", end=" ", flush=True)
-
-        if md_file is None and use_vlm:
+        if ext == "html":
+            md_file, err = _run_mineru(
+                ["mineru-open-api", "crawl", url, "-o", str(tmp_dir)], env, tmp_dir)
+        else:
+            if not token:
+                print("[FAIL] PDF 转换需要 MINERU_TOKEN")
+                return False
+            env["MINERU_TOKEN"] = token
             print("vlm ...", end=" ", flush=True)
-            md_file = _run_mineru(
-                ["mineru-open-api", "extract", str(file_path),
+            md_file, err = _run_mineru(
+                ["mineru-open-api", "extract", str(src_path),
                  "-o", str(tmp_dir), "--model", "vlm"],
                 env, tmp_dir)
 
-        if md_file is None and not use_vlm:
-            # vlm 关闭时降级到 pipeline
-            print("pipeline ...", end=" ", flush=True)
-            md_file = _run_mineru(
-                ["mineru-open-api", "extract", str(file_path),
-                 "-o", str(tmp_dir), "--model", "pipeline"],
-                env, tmp_dir)
+        if err:
+            print(f"[FAIL] {err}")
+            return False
 
-    if md_file is None:
+        shutil.move(str(md_file), str(dest_path))
+        return True
+    finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        print(f" [FAIL]")
-        return None
-
-    result_path = Path(tempfile.gettempdir()) / f"{os.urandom(6).hex()}.md"
-    shutil.move(str(md_file), str(result_path))
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    return result_path
 
 
 def main():
@@ -189,8 +165,6 @@ def main():
     parser.add_argument("--year", "-y", help="年份，如 1998 或 1977-2024")
     parser.add_argument("--output", "-o", default="letters", help="输出目录")
     parser.add_argument("--force", "-f", action="store_true", help="强制重新下载和转换")
-    parser.add_argument("--pipeline", action="store_true", help="用 pipeline 模型代替 vlm（积分消耗低，表格精度差）")
-    parser.add_argument("--flash", action="store_true", help="先试 flash-extract（限 20 页）→ vlm 兜底")
     args = parser.parse_args()
 
     token = load_token()
@@ -207,8 +181,6 @@ def main():
     all_letters = fetch_letter_list()
     targets = [(y, u, e, n) for y, u, e, n in all_letters if year_min <= y <= year_max]
     print(f"找到 {len(targets)} 封信（{year_min}-{year_max}）")
-    if not args.pipeline and not args.flash:
-        print(f"PDF 模型: vlm（高精度，需 token）")
 
     ok = fail = skip = 0
     for year, url, ext, raw_name in targets:
@@ -232,12 +204,7 @@ def main():
 
         # 3) MinerU 转换
         print(f"[{year}] 转换 {raw_fname} ...", end=" ", flush=True)
-        result = convert_with_mineru(
-            raw_path, dl_url, mineru_ext, token,
-            use_vlm=not args.pipeline, use_flash=args.flash,
-        )
-        if result:
-            shutil.move(str(result), str(md_path))
+        if convert_with_mineru(raw_path, dl_url, mineru_ext, token, md_path):
             print(f"OK ({md_path.stat().st_size:,} bytes)")
             ok += 1
         else:
