@@ -120,30 +120,39 @@ def _run_mineru(cmd: list, env: dict, tmp_dir: Path) -> Path | None:
     return md_files[0] if md_files else None
 
 
-def convert_with_mineru(file_path: Path, url: str, ext: str, token: str) -> Path | None:
-    """MinerU 转换 → 返回 markdown 文件路径"""
+def convert_with_mineru(file_path: Path, url: str, ext: str, token: str, use_vlm: bool = False) -> Path | None:
+    """MinerU 转换 → 返回 markdown 文件路径
+
+    策略:
+      - HTML: crawl
+      - PDF: 默认 flash-extract（限 20 页）
+      - PDF 失败或 --vlm: extract --model vlm（高精度，复杂表格更强）
+    """
     tmp_dir = Path(tempfile.mkdtemp(prefix="mineru_"))
     env = os.environ.copy()
     if token:
         env["MINERU_TOKEN"] = token
 
     md_file = None
-    stderr = ""
 
     if ext == "html":
-        # HTML → crawl
         md_file = _run_mineru(
             ["mineru-open-api", "crawl", url, "-o", str(tmp_dir)], env, tmp_dir)
     else:
-        # PDF: 先试 flash-extract（免 token / 快速），失败再降级 extract
-        md_file = _run_mineru(
-            ["mineru-open-api", "flash-extract", str(file_path), "-o", str(tmp_dir)],
-            env, tmp_dir)
-        if md_file is None and token:
-            print("flash 失败，降级 extract ...", end=" ", flush=True)
+        if not use_vlm:
+            # 先试 flash-extract（免 token / 限 20 页）
+            md_file = _run_mineru(
+                ["mineru-open-api", "flash-extract", str(file_path), "-o", str(tmp_dir)],
+                env, tmp_dir)
+        if md_file is None:
+            if not token:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                print(" [FAIL] 需 token 才能降级")
+                return None
+            print(f"extract (vlm) ...", end=" ", flush=True)
             md_file = _run_mineru(
                 ["mineru-open-api", "extract", str(file_path),
-                 "-o", str(tmp_dir), "--model", "pipeline"],
+                 "-o", str(tmp_dir), "--model", "vlm"],
                 env, tmp_dir)
 
     if md_file is None:
@@ -162,6 +171,7 @@ def main():
     parser.add_argument("--year", "-y", help="年份，如 1998 或 1977-2024")
     parser.add_argument("--output", "-o", default="letters", help="输出目录")
     parser.add_argument("--force", "-f", action="store_true", help="强制重新下载和转换")
+    parser.add_argument("--vlm", action="store_true", help="所有 PDF 强制用 vlm 模型（精度高，复杂表格更强，慢）")
     args = parser.parse_args()
 
     token = load_token()
@@ -201,7 +211,7 @@ def main():
 
         # 3) MinerU 转换
         print(f"[{year}] 转换 {raw_fname} ...", end=" ", flush=True)
-        result = convert_with_mineru(raw_path, dl_url, mineru_ext, token)
+        result = convert_with_mineru(raw_path, dl_url, mineru_ext, token, use_vlm=args.vlm)
         if result:
             shutil.move(str(result), str(md_path))
             print(f"OK ({md_path.stat().st_size:,} bytes)")
