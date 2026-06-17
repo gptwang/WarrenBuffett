@@ -86,13 +86,16 @@ def download_raw(url: str, save_path: Path) -> bool:
 
 
 def convert_with_mineru(raw_path: Path, url: str, output_dir: Path, ext: str, token: str):
-    """MinerU 转换 → Markdown"""
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """MinerU 转换 → Markdown（用临时目录避免旧文件干扰）"""
+    import tempfile
+    import shutil
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="mineru_"))
 
     if ext == "html":
-        cmd = ["mineru-open-api", "crawl", url, "-o", str(output_dir)]
+        cmd = ["mineru-open-api", "crawl", url, "-o", str(tmp_dir)]
     else:
-        cmd = ["mineru-open-api", "flash-extract", str(raw_path), "-o", str(output_dir)]
+        cmd = ["mineru-open-api", "flash-extract", str(raw_path), "-o", str(tmp_dir)]
 
     env = os.environ.copy()
     env["MINERU_TOKEN"] = token
@@ -102,13 +105,22 @@ def convert_with_mineru(raw_path: Path, url: str, output_dir: Path, ext: str, to
         shell=True if sys.platform == "win32" else False,
     )
     if result.returncode != 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         print(f" [FAIL] {result.stderr.strip()}")
         return None
 
-    for f in output_dir.iterdir():
-        if f.suffix == ".md":
-            return f
-    return None
+    # 找到临时目录中的 md 文件
+    md_files = list(tmp_dir.glob("*.md"))
+    if not md_files:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(" [FAIL] 未生成 .md 文件")
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_path = output_dir / md_files[0].name
+    shutil.move(str(md_files[0]), str(result_path))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return result_path
 
 
 def main():
