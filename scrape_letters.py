@@ -1,32 +1,27 @@
 """抓取巴菲特致股东信 → 原始文件 + Markdown（MinerU）
 
-目录结构:
-    letters/
-      1977.html      ← 原始 HTML
-      1977.md        ← MinerU 转换
-      2004ltr.pdf    ← 原始 PDF
-      2004.md        ← MinerU 转换
-      ...
+版本选择:
+    1977-1997: 直接 HTML（页面即信件内容）
+    1998-2003: 导航页，下载 PDF 版本（Berkshire 推荐）
+    2004-2024: 直接 PDF
 
 用法:
-    python scrape_letters.py                     # 抓取所有年份
-    python scrape_letters.py --year 1977         # 只抓某一年
-    python scrape_letters.py --year 1977-2024    # 抓取年份范围
+    python scrape_letters.py                 # 抓取所有年份（已存在跳过）
+    python scrape_letters.py --year 1998     # 单年
+    python scrape_letters.py --year 1977-2024
+    python scrape_letters.py --year 1998 --force   # 强制重新下载+转换
 
-依赖:
-    pip install requests
-    npm install -g mineru-open-api
-
-配置:
-    复制 .env.example → .env，填入 MINERU_TOKEN
-    或设置环境变量: export MINERU_TOKEN=xxx
+依赖: pip install requests
+需要: mineru-open-api + MINERU_TOKEN（PDF 用 flash-extract 免 token）
 """
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import requests
@@ -36,7 +31,6 @@ ROOT = Path(__file__).resolve().parent
 
 
 def load_token() -> str:
-    """加载 MinerU token（优先级: 环境变量 > .env）"""
     token = os.environ.get("MINERU_TOKEN", "")
     if token:
         return token
@@ -48,9 +42,7 @@ def load_token() -> str:
                 token = line.split("=", 1)[1].strip()
                 if token:
                     return token
-    print("[ERROR] 未找到 MINERU_TOKEN，请设置环境变量或在 .env 中配置")
-    print("        获取 token: https://mineru.net/apiManage/token")
-    sys.exit(1)
+    return ""  # PDF flash-extract 不需要 token
 
 
 def fetch_letter_list():
@@ -73,10 +65,17 @@ def fetch_letter_list():
     return letters
 
 
-def download_raw(url: str, save_path: Path) -> bool:
-    """下载原始文件"""
+def fetch_page(url: str) -> str:
+    """获取页面 HTML 内容"""
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+def download_file(url: str, save_path: Path) -> bool:
+    """下载文件"""
     try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=120)
         resp.raise_for_status()
         save_path.write_bytes(resp.content)
         return True
@@ -85,48 +84,84 @@ def download_raw(url: str, save_path: Path) -> bool:
         return False
 
 
-def convert_with_mineru(raw_path: Path, url: str, output_dir: Path, ext: str, token: str):
-    """MinerU 转换 → Markdown（用临时目录避免旧文件干扰）"""
-    import tempfile
-    import shutil
+def resolve_source(year, base_url, ext):
+    """
+    解析最佳数据源:
+    - 1977-1997 HTML: 页面即信件内容
+    - 1998-2003 HTML: 导航页 → 下载 PDF 版本
+    - 2004+ PDF: 直接使用
+    返回: (download_url, raw_name, ext_for_mineru)
+    """
+    if ext == "pdf":
+        return base_url, f"{year}ltr.pdf", "pdf"
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="mineru_"))
+    html = fetch_page(base_url)
+    # 导航页中的 PDF 链接，格式多样: 1998pdf.pdf / final1999pdf.pdf / 2003ltr.pdf
+    pdf_match = re.search(r'href="([^"]*(?:pdf|ltr)\.pdf)"', html, re.IGNORECASE)
 
-    if ext == "html":
-        cmd = ["mineru-open-api", "crawl", url, "-o", str(tmp_dir)]
-    else:
-        cmd = ["mineru-open-api", "flash-extract", str(raw_path), "-o", str(tmp_dir)]
+    if pdf_match:
+        pdf_path = pdf_match.group(1)
+        pdf_url = f"{BASE_URL}/{pdf_path}"
+        raw_name = f"{year}.pdf"
+        return pdf_url, raw_name, "pdf"
 
-    env = os.environ.copy()
-    env["MINERU_TOKEN"] = token
+    return base_url, f"{year}.html", "html"
 
+
+def _run_mineru(cmd: list, env: dict, tmp_dir: Path) -> Path | None:
+    """执行 mineru 命令，返回 md 文件路径"""
     result = subprocess.run(
         cmd, env=env, capture_output=True, text=True, timeout=600,
         shell=True if sys.platform == "win32" else False,
     )
     if result.returncode != 0:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        print(f" [FAIL] {result.stderr.strip()}")
         return None
-
-    # 找到临时目录中的 md 文件
     md_files = list(tmp_dir.glob("*.md"))
-    if not md_files:
+    return md_files[0] if md_files else None
+
+
+def convert_with_mineru(file_path: Path, url: str, ext: str, token: str) -> Path | None:
+    """MinerU 转换 → 返回 markdown 文件路径"""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="mineru_"))
+    env = os.environ.copy()
+    if token:
+        env["MINERU_TOKEN"] = token
+
+    md_file = None
+    stderr = ""
+
+    if ext == "html":
+        # HTML → crawl
+        md_file = _run_mineru(
+            ["mineru-open-api", "crawl", url, "-o", str(tmp_dir)], env, tmp_dir)
+    else:
+        # PDF: 先试 flash-extract（免 token / 快速），失败再降级 extract
+        md_file = _run_mineru(
+            ["mineru-open-api", "flash-extract", str(file_path), "-o", str(tmp_dir)],
+            env, tmp_dir)
+        if md_file is None and token:
+            print("flash 失败，降级 extract ...", end=" ", flush=True)
+            md_file = _run_mineru(
+                ["mineru-open-api", "extract", str(file_path),
+                 "-o", str(tmp_dir), "--model", "pipeline"],
+                env, tmp_dir)
+
+    if md_file is None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        print(" [FAIL] 未生成 .md 文件")
+        print(f" [FAIL]")
         return None
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    result_path = output_dir / md_files[0].name
-    shutil.move(str(md_files[0]), str(result_path))
+    result_path = Path(tempfile.gettempdir()) / f"{os.urandom(6).hex()}.md"
+    shutil.move(str(md_file), str(result_path))
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return result_path
 
 
 def main():
     parser = argparse.ArgumentParser(description="抓取巴菲特致股东信")
-    parser.add_argument("--year", "-y", help="年份，如 1977 或 1977-2024")
+    parser.add_argument("--year", "-y", help="年份，如 1998 或 1977-2024")
     parser.add_argument("--output", "-o", default="letters", help="输出目录")
+    parser.add_argument("--force", "-f", action="store_true", help="强制重新下载和转换")
     args = parser.parse_args()
 
     token = load_token()
@@ -146,25 +181,29 @@ def main():
 
     ok = fail = skip = 0
     for year, url, ext, raw_name in targets:
-        raw_path = output_dir / raw_name
         md_path = output_dir / f"{year}.md"
 
-        if md_path.exists() and raw_path.exists():
+        if not args.force and md_path.exists():
             print(f"[{year}] 跳过（已存在）")
             skip += 1
             continue
 
-        if not raw_path.exists():
-            print(f"[{year}] 下载 {raw_name} ...", end=" ", flush=True)
-            if not download_raw(url, raw_path):
+        # 1) 解析最佳数据源
+        dl_url, raw_fname, mineru_ext = resolve_source(year, url, ext)
+        raw_path = output_dir / raw_fname
+
+        # 2) 下载原始文件（如需要）
+        if not raw_path.exists() or args.force:
+            print(f"[{year}] 下载 {raw_fname} ({mineru_ext}) ...", end=" ", flush=True)
+            if not download_file(dl_url, raw_path):
                 fail += 1
                 continue
 
-        print(f"[{year}] 转换 {raw_name} ...", end=" ", flush=True)
-        result = convert_with_mineru(raw_path, url, output_dir, ext, token)
+        # 3) MinerU 转换
+        print(f"[{year}] 转换 {raw_fname} ...", end=" ", flush=True)
+        result = convert_with_mineru(raw_path, dl_url, mineru_ext, token)
         if result:
-            if result.name != f"{year}.md":
-                result.rename(md_path)
+            shutil.move(str(result), str(md_path))
             print(f"OK ({md_path.stat().st_size:,} bytes)")
             ok += 1
         else:
